@@ -9,6 +9,13 @@
 #include "libarff/arff_parser.h"
 #include "libarff/arff_data.h"
 #include <bits/stdc++.h>
+#include <cuda_runtime.h>
+
+#ifdef __CDT_PARSER__
+#define __global__
+#define __device__
+#define __shared__
+#endif
 
 using namespace std;
 
@@ -19,6 +26,10 @@ float distanceSquared(ArffInstance* a, ArffInstance* b){
         sum += diff*diff;
     }
     return sum;
+}
+
+__global__ void pairwiseDistanceKernel(float* X_data, float* distances){
+
 }
 
 int* KNN(ArffData* dataset, int k){
@@ -90,18 +101,91 @@ int* KNN(ArffData* dataset, int k){
     return predictions;
 }
 
-int compare(const void *a, const void *b) {
-    int x1 = *(const int*)a;
-    int x2 = *(const int*)b;
-    if (x1 > x2) return  1;
-    if (x1 < x2) return -1;
-    // x1 and x2 are equal; compare y's
-    int y1 = *(((const int*)a)+1);
-    int y2 = *(((const int*)b)+1);
-    if (y1 > y2) return  1;
-    if (y1 < y2) return -1;
-    return 0;
+int* KNN_GPU(ArffData* dataset, int k){
+	//
+	// Performs a (num_instances * num_feature) x (num_feature * num_instances)^T tiled matrix difference and squaring
+	// This generates a pairwise distance from every instance to every other instance
+	// The k nearest neighbors are then identified with a k-nary min reduction over each instance.
+	//
+
+	// predictions is the array where you have to return the class predicted (integer) for the dataset instances
+	int* predictions = (int*)malloc(dataset->num_instances() * sizeof(int));
+	int NUM_CLASSES = dataset->num_classes();
+
+	int num_features = dataset->num_attributes()-1;
+	int num_elements = dataset->num_instances() * num_features;
+
+	float* h_X_data  = (float*)malloc( num_elements * sizeof(float) );
+	float* h_pairwise_distances  = (float*)malloc( num_elements * sizeof(float) );
+	float* h_y_data = (float*)malloc(dataset->num_instances() * sizeof(float));
+
+	for(int instance = 0; instance < dataset->num_instances(); instance++){
+		h_y_data[instance] = dataset->get_instance(instance)->get(num_features)->operator float();
+		for(int feature = 0; feature < num_features; feature++){
+			h_X_data[instance*num_features + feature] = dataset->get_instance(instance)->get(feature)->operator float();
+		}
+	}
+
+	float *d_X_data, *d_pairwise_distances, *d_y_data;
+
+	cudaMalloc(&d_X_data, num_elements * sizeof(float));
+	cudaMalloc(&d_pairwise_distances, num_elements * sizeof(float));
+	cudaMalloc(&d_y_data, dataset->num_instances() * sizeof(float));
+
+	cudaMemcpy(d_X_data, h_X_data, num_elements * sizeof(float), cudaMemcpyHostToDevice);
+	cudaMemcpy(d_y_data, h_y_data, dataset->num_instances() * sizeof(float), cudaMemcpyHostToDevice);
+
+	//rectangular grid of 16x16 blocks
+
+	int threadsPerBlockDim = 16;
+	int gridDimSizeX = (num_features + threadsPerBlockDim - 1) / threadsPerBlockDim; //will always be 1 for our datasets.
+	int gridDimSizeY = (dataset->num_instances() + threadsPerBlockDim - 1) / threadsPerBlockDim;
+
+	dim3 blockSize(threadsPerBlockDim, threadsPerBlockDim);
+	dim3 gridSize (gridDimSizeX, gridDimSizeY);
+
+	cudaEvent_t start, stop;
+	cudaEventCreate(&start);
+	cudaEventCreate(&stop);
+
+	cudaEventRecord(start);
+
+	pairwiseDistanceKernel<<<gridSize, blockSize>>>(d_X_data, d_pairwise_distances);
+
+	cudaMemcpy(h_pairwise_distances, d_pairwise_distances, num_elements * sizeof(float), cudaMemcpyDeviceToHost);
+	cudaEventRecord(stop);
+	cudaEventSynchronize(stop);
+
+
+
+
+	for(int instance = 0; instance < dataset->num_instances(); instance++){
+		for(int feature = 0; feature < num_features; feature++){
+			cout << h_pairwise_distances[instance*num_features + feature] << " ";
+		}
+//		cout << "|" << y_data[instance] << "\n";
+	}
+
+
+    cudaFree(d_X_data);
+    cudaFree(d_y_data);
+
+	return predictions;
 }
+
+
+//int compare(const void *a, const void *b) {
+//    int x1 = *(const int*)a;
+//    int x2 = *(const int*)b;
+//    if (x1 > x2) return  1;
+//    if (x1 < x2) return -1;
+//    // x1 and x2 are equal; compare y's
+//    int y1 = *(((const int*)a)+1);
+//    int y2 = *(((const int*)b)+1);
+//    if (y1 > y2) return  1;
+//    if (y1 < y2) return -1;
+//    return 0;
+//}
 
 
 //int* KNN_MPI(ArffData* dataset, int k){
@@ -274,8 +358,9 @@ int main(int argc, char *argv[]){
     
     clock_gettime(CLOCK_MONOTONIC_RAW, &start);
     int* predictions = NULL;
+
     // Get the class predictions
-	predictions = KNN(dataset, k);
+	predictions = KNN_GPU(dataset, k);
 
 	// Compute the confusion matrix
 	int* confusionMatrix = computeConfusionMatrix(predictions, dataset);
