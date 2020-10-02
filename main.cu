@@ -28,7 +28,52 @@ float distanceSquared(ArffInstance* a, ArffInstance* b){
     return sum;
 }
 
-__global__ void pairwiseDistanceKernel(float* X_data, float* distances){
+__global__ void pairwiseDistanceKernel(float* X_data, float* distances, int num_instances, int num_features){
+	//computes pairwise distances between instances in X_data
+	//each thread computes the distance between instance i and instance j.
+	int instance_i = blockDim.x * blockIdx.x + threadIdx.x;
+	int instance_j = blockDim.y * blockIdx.y + threadIdx.y;
+
+	//skip threads on the edge blocks that cross the matrix boundary
+	if (instance_i >= num_instances || instance_j >= num_instances){return;}
+	if (instance_i < instance_i){return;}
+
+	float squared_distance = 0;
+	for(int f = 0; f < num_features; f++){
+		float difference = X_data[instance_i*num_features + f] - X_data[instance_j*num_features + f];
+		squared_distance += difference*difference;
+	}
+
+	distances[num_instances*instance_j + instance_i] = distances[num_instances*instance_i + instance_j]  = squared_distance;
+
+}
+
+__global__ void perInstanceKNN_LinearReduction(float* distances, float* classes, int k, int num_instances){
+	//parallelizes along the data dimension a minimum reduction
+	//selection sort for smallest k
+	int tid = blockDim.x * blockIdx.x + threadIdx.x;
+
+	if (tid > num_instances) return;
+//	printf("%i\n", tid);
+	distances[tid*num_instances + tid] = FLT_MAX;
+	for(int neighbor = 0; neighbor < k; neighbor++){
+		int min_index = neighbor;
+		for(int i = neighbor+1; i < num_instances; i++){
+			if(distances[tid*num_instances + i] < distances[tid*num_instances + min_index]){
+				min_index = i;
+			}
+		}
+
+		//swap
+		float temp = classes[tid*num_instances + neighbor];
+		classes[tid*num_instances + neighbor] = classes[tid*num_instances + min_index];
+		classes[tid*num_instances + min_index] = temp;
+
+		temp = distances[tid*num_instances + neighbor];
+		distances[tid*num_instances + neighbor] = distances[tid*num_instances + min_index];
+		distances[tid*num_instances + min_index] = temp;
+
+	}
 
 }
 
@@ -116,200 +161,116 @@ int* KNN_GPU(ArffData* dataset, int k){
 	int num_elements = dataset->num_instances() * num_features;
 
 	float* h_X_data  = (float*)malloc( num_elements * sizeof(float) );
-	float* h_pairwise_distances  = (float*)malloc( num_elements * sizeof(float) );
-	float* h_y_data = (float*)malloc(dataset->num_instances() * sizeof(float));
+	float* h_pairwise_distances  = (float*)malloc( dataset->num_instances()*dataset->num_instances() * sizeof(float) );
+	float* h_classes  = (float*)malloc( dataset->num_instances()*dataset->num_instances() * sizeof(float) );
 
+	//loads data from ARFF format in flat array
 	for(int instance = 0; instance < dataset->num_instances(); instance++){
-		h_y_data[instance] = dataset->get_instance(instance)->get(num_features)->operator float();
+		for(int instance2 = 0; instance2 < dataset->num_instances(); instance2++){
+			h_classes[instance*dataset->num_instances() + instance2] = dataset->get_instance(instance2)->get(num_features)->operator float();
+		}
 		for(int feature = 0; feature < num_features; feature++){
 			h_X_data[instance*num_features + feature] = dataset->get_instance(instance)->get(feature)->operator float();
 		}
 	}
 
-	float *d_X_data, *d_pairwise_distances, *d_y_data;
+	float *d_X_data, *d_pairwise_distances, *d_classes;
 
 	cudaMalloc(&d_X_data, num_elements * sizeof(float));
-	cudaMalloc(&d_pairwise_distances, num_elements * sizeof(float));
-	cudaMalloc(&d_y_data, dataset->num_instances() * sizeof(float));
+	cudaMalloc(&d_pairwise_distances, dataset->num_instances() * dataset->num_instances() * sizeof(float));
+	cudaMalloc(&d_classes, dataset->num_instances() * dataset->num_instances() * sizeof(float));
 
 	cudaMemcpy(d_X_data, h_X_data, num_elements * sizeof(float), cudaMemcpyHostToDevice);
-	cudaMemcpy(d_y_data, h_y_data, dataset->num_instances() * sizeof(float), cudaMemcpyHostToDevice);
+	cudaMemcpy(d_classes, h_classes, dataset->num_instances() * dataset->num_instances() * sizeof(float), cudaMemcpyHostToDevice);
 
 	//rectangular grid of 16x16 blocks
-
-	int threadsPerBlockDim = 16;
-	int gridDimSizeX = (num_features + threadsPerBlockDim - 1) / threadsPerBlockDim; //will always be 1 for our datasets.
-	int gridDimSizeY = (dataset->num_instances() + threadsPerBlockDim - 1) / threadsPerBlockDim;
-
-	dim3 blockSize(threadsPerBlockDim, threadsPerBlockDim);
-	dim3 gridSize (gridDimSizeX, gridDimSizeY);
 
 	cudaEvent_t start, stop;
 	cudaEventCreate(&start);
 	cudaEventCreate(&stop);
+	float milliseconds = 0;
 
 	cudaEventRecord(start);
 
-	pairwiseDistanceKernel<<<gridSize, blockSize>>>(d_X_data, d_pairwise_distances);
+	int threadsPerBlockDim = 16;
+	int gridDimSize = (dataset->num_instances() + threadsPerBlockDim - 1) / threadsPerBlockDim;
 
-	cudaMemcpy(h_pairwise_distances, d_pairwise_distances, num_elements * sizeof(float), cudaMemcpyDeviceToHost);
+	dim3 blockSize(threadsPerBlockDim, threadsPerBlockDim);
+	dim3 gridSize (gridDimSize, gridDimSize);
+
+	//stores into d_pairwise_distances the distance between instance i and instance j
+	pairwiseDistanceKernel<<<gridSize, blockSize>>>(d_X_data, d_pairwise_distances, dataset->num_instances(), num_features);
+
+	int threadsPerBlockDimReduction = 16;
+	int gridDimSizeReduction = (dataset->num_instances() + threadsPerBlockDimReduction - 1) / threadsPerBlockDimReduction;
+
+	dim3 blockSizeReduction(threadsPerBlockDimReduction);
+	dim3 gridSizeReduction (gridDimSizeReduction);
+
+	perInstanceKNN_LinearReduction<<<gridSizeReduction, blockSizeReduction>>>(d_pairwise_distances, d_classes, k,  dataset->num_instances());
+
+	cudaMemcpy(h_classes, d_classes,
+			dataset->num_instances() * dataset->num_instances() * sizeof(float), cudaMemcpyDeviceToHost);
 	cudaEventRecord(stop);
 	cudaEventSynchronize(stop);
 
+	cudaEventElapsedTime(&milliseconds, start, stop);
+	printf("GPU computation took %f ms\n", milliseconds);
 
+	//compute max
 
-
-	for(int instance = 0; instance < dataset->num_instances(); instance++){
-		for(int feature = 0; feature < num_features; feature++){
-			cout << h_pairwise_distances[instance*num_features + feature] << " ";
+	int* class_counts = (int*)calloc(NUM_CLASSES, sizeof(int));
+	for(int instance=0; instance <  dataset->num_instances(); instance++){
+		for(int i = 0; i < k; i++){
+//			cout << h_classes[instance * dataset->num_instances() + i] << " ";
+			class_counts[ (int) h_classes[instance * dataset->num_instances() + i] ] += 1;
 		}
-//		cout << "|" << y_data[instance] << "\n";
+
+		int max = -1;
+		int max_class = -1;
+		for(int i = 0; i < NUM_CLASSES; i++){
+			if(class_counts[i] > max){
+				max = class_counts[i];
+				max_class = i;
+			}
+		}
+		predictions[instance] = max_class;
+//		cout << " | " << predictions[instance];
+
+//		cout << "\n";
+
+		memset(class_counts, 0, NUM_CLASSES * sizeof(int));
 	}
+
+    cudaError_t cudaError = cudaGetLastError();
+
+    if(cudaError != cudaSuccess)
+    {
+        fprintf(stderr, "cudaGetLastError() returned %d: %s\n", cudaError, cudaGetErrorString(cudaError));
+        exit(EXIT_FAILURE);
+    }
+
+
+
+
+
+
+
+//	for(int instance = 0; instance < 200; instance++){
+//		for(int instance2 = 0; instance2 < dataset->num_instances(); instance2++){
+//			cout << h_pairwise_distances[instance*dataset->num_instances() + instance2] << " ";
+//		}
+//		cout << "\n";
+//	}
 
 
     cudaFree(d_X_data);
-    cudaFree(d_y_data);
+    cudaFree(d_classes);
 
 	return predictions;
 }
 
 
-//int compare(const void *a, const void *b) {
-//    int x1 = *(const int*)a;
-//    int x2 = *(const int*)b;
-//    if (x1 > x2) return  1;
-//    if (x1 < x2) return -1;
-//    // x1 and x2 are equal; compare y's
-//    int y1 = *(((const int*)a)+1);
-//    int y2 = *(((const int*)b)+1);
-//    if (y1 > y2) return  1;
-//    if (y1 < y2) return -1;
-//    return 0;
-//}
-
-
-//int* KNN_MPI(ArffData* dataset, int k){
-//    //For each query vector, sends out instance id's to each worker thread to compute local k-NN on subset.
-//    //Gathers the computed distances and classes from each worker process then re-ranks to generate global k-NN.
-//    int rank, num_tasks;
-//    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-//    MPI_Comm_size(MPI_COMM_WORLD, &num_tasks);
-//
-//    int* predictions = (int*)malloc(dataset->num_instances() * sizeof(int));
-//
-//    //Compute number of classes
-//    int NUM_CLASSES = dataset->num_classes();
-//    int NUM_INSTANCES = dataset->num_instances();
-////    for(int i = 0; i < dataset->num_instances(); i++){
-////        int class_index = dataset->get_instance(i)->get(dataset->num_attributes() - 1)->operator long();
-////        if(class_index+1 > NUM_CLASSES){
-////            NUM_CLASSES = class_index+1;
-////        }
-////    }
-//
-//    //stores global k-NN candidates for a query vector, filled via gather from all processes
-//    float* global_candidates = (float*) calloc(k*2*num_tasks, sizeof(float));
-//
-//    //stores per process local k-NN candidates as a sorted 2d array. First element is inner product, second is class.
-//    float* local_candidates = (float*) calloc(k*2, sizeof(float));
-//    for(int i = 0; i < 2*k; i++){local_candidates[i] = FLT_MAX;}
-//
-//    //stores bincounts of each class over the final set of candidate NN
-//    int* classCounts = (int*)calloc(NUM_CLASSES, sizeof(int));
-//
-//    int instances_per_task = NUM_INSTANCES / num_tasks + 1;
-//
-//    int* displacements = (int *)malloc(num_tasks*sizeof(int));
-//    int* receive_counts = (int *)malloc(num_tasks*sizeof(int));
-//
-//    for(int i = 0; i < num_tasks; i++){
-//        displacements[i] = k*2*i;
-//        receive_counts[i] = 2*k;
-//    }
-//
-//    //Array of instance ids padded with -1 to account for last task
-//    int* instance_ids_to_scatter = (int*)malloc((instances_per_task * num_tasks)*sizeof(int));
-//    memset(instance_ids_to_scatter, -1, (instances_per_task * num_tasks) * sizeof(int));
-//    for(int i = 0; i < NUM_INSTANCES; i++){
-//        instance_ids_to_scatter[i] = i;
-//    }
-//
-//    //Start MPI section
-//
-//    //contains per task instances
-//    int* task_instances = (int*)malloc(instances_per_task*sizeof(int));
-//
-//    //the current query index (scattered by task 0 for every query)
-//
-//
-//    //send instances to each process for computation
-//    MPI_Scatter(instance_ids_to_scatter, instances_per_task, MPI_INT, task_instances, instances_per_task, MPI_INT,0, MPI_COMM_WORLD);
-//
-//    for(int query = 0; query < NUM_INSTANCES; query++){
-//        for(int key = 0; key < instances_per_task; key++){
-//            if (query == task_instances[key] or task_instances[key] == -1) continue;
-//            float d_squared = distanceSquared(dataset->get_instance(query), dataset->get_instance(task_instances[key]));
-////            cout << d_squared << endl;
-//            for(int c = 0; c < k; c++){
-//                if(d_squared < local_candidates[2*c]) {
-//                    //Found a new candidate
-//                    //Shift previous candidates down by one
-//                    for (int x = k - 2; x >= c; x--) {
-//                        local_candidates[2 * x + 2] = local_candidates[2 * x];
-//                        local_candidates[2 * x + 3] = local_candidates[2 * x + 1];
-//                    }
-//                    //set key vector as potential k NN
-//                    local_candidates[2 * c] = d_squared;
-//                    local_candidates[2 * c + 1] = dataset->get_instance(task_instances[key])->get(
-//                            dataset->num_attributes() - 1)->operator float();
-//
-//                    break;
-//                }
-//            }
-//
-//        }
-//
-//        //local_candidates now contains the local KNN for the query
-//        //Gather back to the main process
-//        MPI_Gatherv(local_candidates, 2*k, MPI_FLOAT,
-//                    global_candidates, receive_counts, displacements, MPI_FLOAT, 0,
-//                   MPI_COMM_WORLD);
-//
-//
-//        //compute true k-NN from set of global candidates
-//
-//
-//
-//
-//        if(rank == 0){
-//            //sorted global candidates by distance
-//            qsort(global_candidates, k*num_tasks, 2*sizeof(float), compare);
-//
-//            //bincount the candidate labels and pick the most common
-//            for(int i = 0; i < k;i++){
-//                classCounts[(int)global_candidates[2*i+1]] += 1;
-//            }
-//            int max = -1;
-//            int max_index = 0;
-//            for(int i = 0; i < NUM_CLASSES;i++){
-//                if(classCounts[i] > max){
-//                    max = classCounts[i];
-//                    max_index = i;
-//                }
-//            }
-//
-//            predictions[query] = max_index;
-//            memset(classCounts, 0, NUM_CLASSES * sizeof(int));
-//
-//        }
-//
-//
-//        for(int i = 0; i < 2*k; i++){local_candidates[i] = FLT_MAX;}
-//
-//    }
-//
-//    return predictions;
-//}
 
 int* computeConfusionMatrix(int* predictions, ArffData* dataset)
 {
@@ -320,6 +281,8 @@ int* computeConfusionMatrix(int* predictions, ArffData* dataset)
         int trueClass = dataset->get_instance(i)->get(dataset->num_attributes() - 1)->operator int32();
         int predictedClass = predictions[i];
         
+//        cout << trueClass << " " << predictedClass << "\n";
+
         confusionMatrix[trueClass*dataset->num_classes() + predictedClass]++;
     }
     
